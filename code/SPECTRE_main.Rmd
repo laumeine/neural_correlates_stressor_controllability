@@ -1,0 +1,985 @@
+---
+title: "Analyses for 'Neural Correlates of Stressor Controllability in Humans'"
+author: "Laura E. Meine & Jana Meier"
+date: "28.10.2020"
+output:
+  html_document:
+    number_sections: yes
+    theme: flatly
+    toc: yes
+    toc_float: yes
+  word_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr:: opts_chunk$set(cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, fig.align="center")
+```
+
+# Script Overview
+Built with R `r getRversion()`
+
+This script runs analyses on data from the SPECTRE study. Specifically, it investigates different read-outs as a function of whether participants experienced controllable or uncontrollable stress (or no stress). Measurements under investigation comprised participant ratings (stressor aversiveness, perceived control, stress, helplessness), reaction times, correct responses, and heart rates. In addition, MR parameter estimates from a GLM analysis of related imaging data were investigated and linked to the ratings.
+
+Here we use the following abbreviations: controllable stress = con; uncontrollable stress = noc, baseline = bas.
+
+Linear mixed-effects models were constructed based on the tutorial referenced in 
+Singmann & Kellen, 2019: https://cran.r-project.org/web/packages/afex/vignettes/afex_mixed_example.html
+
+```{r set stage}
+# load required libraries
+library(tidyverse) # data formatting, ggplot2
+library(magrittr) # piping %<>%
+library(rstatix) # identify outliers
+library(afex) # mixed-effects models
+library(emmeans); library(multcomp) # post-hoc tests
+library(effsize) # cohen's d
+library(sjPlot) # make nice model tables
+source("R_functions/summarySEwithin2.R") # get within-subject standard errors
+source("R_functions/laura_theme.R") # standard ggplot theme
+
+# define 3 theme colours to use (colourblind-friendly, s. http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/)
+colour1 = "#56B4E9" 
+colour2 = "#009E73" 
+colour3 = "#D55E00" 
+
+# define new function so that scale returns a vector, not a matrix
+scale_this <- function(x) as.vector(scale(x))
+```
+
+```{r import, format and merge data}
+demo_notes <- read.csv("../anonymized_data/demo_notes.csv", header=T, sep=",")
+stress <- read.csv("../anonymized_data/controllability_task.csv", header=T, sep=",")
+ratings <- read.csv("../anonymized_data/ratings.csv", header=T, sep=",")
+betas <- read.csv("../anonymized_data/MR_betas.csv", header=T, sep=",") 
+hr <- read.table("../anonymized_data/heart_rate.csv", header=T, sep=",")
+
+# merge data.frames to relate data
+ratings <- list(ratings, betas) %>% reduce(left_join, by = c("id", "run", "condition"))
+
+# factorize id and condition
+stress$id <- as.factor(stress$id) 
+stress$condition <- as.factor(stress$condition)
+
+ratings$id <- as.factor(ratings$id) 
+ratings$condition <- as.factor(ratings$condition)
+
+betas$id <- as.factor(betas$id) 
+betas$condition <- as.factor(betas$condition)
+
+hr$id <- as.factor(hr$id) 
+hr$condition <- as.factor(hr$condition)
+```
+
+```{r exclude cases}
+# exclude cases for...
+# breaking off experiment
+# explicitly noticing difference (con > noc) in average stress duration between conditions
+# electrode malfunction
+# < 25 aversiveness ratings in more than half the runs (likely also due to electrode malfunction)
+
+# anonymized ids
+
+demo_notes <- demo_notes %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
+stress <- stress %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
+ratings <- ratings %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
+hr <- hr %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
+
+stress_ratings <- ratings %>% filter(condition!="bas") %>% droplevels() # aversiveness, perceived control, and helplessness only rated in con and noc
+```
+
+# Sample Descriptives
+
+```{r sample descriptives}
+N <- nrow(demo_notes) # sample size
+
+female <- (table(demo_notes$gender)[1]/nrow(demo_notes))*100 # % female
+
+# age
+age.min <- min(demo_notes$age)
+age.max <- max(demo_notes$age)
+age.m <- mean(demo_notes$age) 
+age.sd <- sd(demo_notes$age)
+```
+*N* = `r round(N,2)` participants aged `r round(age.min,2)`-`r round(age.max,2)` took part in this study (`r round(female,2)` % female, age: *M* = `r round(age.m)`, *SD* = `r round(age.sd,2)`).
+
+# Manipulation Checks
+
+## Version Counterbalancing
+```{r manipulation checks - counterbalancing}
+table(demo_notes$version) # counterbalancing of button-shape associations
+```
+
+## Yoking of Stress Durations
+```{r manipulation checks - yoking}
+# check whether stress duration was properly yoked between con and noc conditions
+stressDur <- stress %>%
+  group_by(id)  %>%
+  summarise(total_con_stress_dur = mean(total_con_stress_dur),
+            total_noc_stress_dur = mean(total_noc_stress_dur),
+            diff = total_con_stress_dur - total_noc_stress_dur)
+
+t.test(stressDur$total_con_stress_dur, stressDur$total_noc_stress_dur, paired=T) 
+cohen.d(stressDur$total_con_stress_dur, stressDur$total_noc_stress_dur) # get cohen's d
+# imperfect yoking, slightly longer overall stress duration in con compared to noc
+# mean of the differences in stress duration was 1.73s 
+
+# check whether participants perceived any difference - update: 2 already excluded!
+nPerceivedDiff <- demo_notes %>%
+  summarise(nPerceivedDiff = sum(trial_difference_perceived), # 22 participants reported having perceived a difference
+            pPerceivedDiff = nPerceivedDiff/n()) # that's 42% of the sample
+
+# what did participants who perceived a difference think? More shocks in con/noc?
+CondMoreShocks <- mutate(demo_notes) %>%
+  filter(! is.na(condition_more_shocks)) %>%
+  summarise(nMoreShocksCon = sum(condition_more_shocks=="1"), # 2 thought they received more shocks in con - already excluded
+            nMoreShocksNoc = sum(condition_more_shocks=="2"), # 19 thought they received more shocks in noc
+            dontKnow = nPerceivedDiff[1] - (nMoreShocksCon + nMoreShocksNoc)) # 1 couldn't tell
+```
+There was a significant difference in overall stress duration between conditions, yoking did not work out properly. Participants were on average exposed to LESS stress in the uncontrollable condition but reported experiencing no difference or even MORE stress in this condition when asked afterwards. Therefore, effects showing greater performance decrements associated with uncontrollable stress cannot be attributed to more stress. Nevertheless, this remains a limitation.
+
+## Stressor Aversiveness
+```{r manipulation checks - stressor aversiveness}
+# check whether shocks were properly calibrated, i.e. perceived as aversive
+aversHist <- ggplot(stress %>% 
+         filter(run==1) %>%
+         group_by(id)  %>%
+         summarise(initial_aversiveness = max(initial_aversiveness)),
+       aes(x=initial_aversiveness)) + 
+  geom_histogram(binwidth = 1) + xlab("initial_aversiveness") + laura_theme()
+aversHist
+# 4 people rated initial aversiveness below 25 - likely because electrode became loose
+initAversLow <- aversHist$data$id[aversHist$data$initial_aversiveness<25] # get their ids: 27,8,36,14
+
+# check aversiveness ratings during experiment (expectation: consistently high  ratings across runs)
+aversLow <- stress_ratings %>% filter(! condition=="bas" & aversiveness<25) %>% 
+  group_by(id) %>% summarise(count = n()) %>% filter(count > 4) # ids 27, 36, 2 rated <25 in more than half the runs - update: already excluded
+
+# compute summary statistics for conditions
+aversCond_sumstats <- summarySEwithin2(stress_ratings, measurevar="aversiveness", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+aversCondRun_sumstats <- summarySEwithin2(stress_ratings, measurevar="aversiveness", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# spaghetti plot
+cond_names <- list('con'="CON", 'noc'="UNCON")
+cond_labeller <- function(variable,value){
+  return(cond_names[value])}
+
+aversSpaghetti <- ggplot(stress_ratings, aes(x=factor(run), y=aversiveness, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=aversCondRun_sumstats, aes(group=condition, x=run, y=aversiveness), size=1, colour="black") +
+  geom_errorbar(data=aversCondRun_sumstats, aes(ymin=aversiveness-se, ymax=aversiveness+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition, labeller=cond_labeller) +
+  scale_y_continuous(breaks=seq(0,100,10), limits=c(0, 100)) +
+  labs(y="Aversiveness", x="Run") +
+  scale_colour_manual(values=c(colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+  #geom_hline(yintercept=25, linetype="dashed")
+aversSpaghetti
+```
+
+```{r manipulation checks - stressor aversiveness - mixed-models}
+# test whether aversiveness ratings differed between con and noc and whether there were changes over runs
+
+stress_ratings$run.z <- scale_this(stress_ratings$run) # mean center run
+
+# maximal model
+avers.max <- mixed(aversiveness ~ condition*run.z + (1+condition*run.z|id), data=stress_ratings, method = "S",
+                   control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(avers.max) # singular fit
+
+# remove correlation of random slopes and intercepts
+avers.m1 <- mixed(aversiveness ~ condition*run.z + (1+condition*run.z||id), data=stress_ratings, method = "S",
+                  control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(avers.m1) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(avers.m1)$varcor 
+
+# remove interaction of random slopes
+avers.m2 <- mixed(aversiveness ~ condition*run.z + (1+condition+run.z||id), data=stress_ratings, method = "S",
+                  control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(avers.m2) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(avers.m2)$varcor 
+
+# remove random slopes for condition and add correlation again
+avers.m3 <- mixed(aversiveness ~ condition*run.z + (1+run.z|id), data=stress_ratings, method = "S",
+                  control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(avers.m3) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+avers.m3d <- lmer(aversiveness ~ condition*run.z + (1+run.z|id), data=stress_ratings, method = "S",
+                  control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+plot(avers.m3d)
+
+# plot random effects
+lattice::dotplot(ranef(avers.m3d))
+
+# compare maximal and reduced model
+avers.m3c <- update(avers.m3, REML=F); avers.maxc <- update(avers.max, REML=F)
+anova(avers.m3c, avers.maxc) # AIC and BIC indicate better fit for reduced model, but no sig difference
+
+# compare results for maximal and reduced model
+avers.results <- left_join(nice(avers.max), nice(avers.m3), by = "Effect", suffix = c("_full", "_final")) # results are very similar
+
+# no differences in aversiveness between conditions
+avers.m <- mean(aversCond_sumstats$aversiveness) # global mean rating
+
+# decreasing aversiveness over runs, evidence for habituation
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(avers.m3,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Stressor Aversiveness"),
+          pred.labels = c("Intercept", 
+                          "Condition",
+                          "Run", 
+                          "Condition x Run"),
+          file = "../output/avers_model.html")
+```
+Participants rated the stressor as very aversive in both controllable and uncontrollable trials (global *M* = `r avers.m`). In both conditions, aversiveness ratings decreased slightly over runs.
+
+## Perceived Control
+```{r manipulation checks - perceived control ratings}
+# boxplot by condition and run
+ctrlBoxPlot <- ggplot(stress_ratings, aes(factor(run), control, fill=condition)) + 
+  geom_violin() +  
+  geom_boxplot(width=0.2, position=position_dodge(1)) +
+  labs(y="control", x="run") +
+  scale_fill_manual(values=c(colour2, colour3)) +
+  laura_theme()
+ctrlBoxPlot # some outliers
+
+# check for outliers by condition and run
+ctrlOutlier <- stress_ratings %>%
+  group_by(condition, run) %>%
+  identify_outliers(control)
+
+# output extreme outliers
+ctrlOutlier <- ctrlOutlier[ctrlOutlier$is.extreme==T,] # none
+
+# compute summary statistics for conditions
+ctrlCond_sumstats <- summarySEwithin2(stress_ratings, measurevar="control", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+ctrlCondRun_sumstats <- summarySEwithin2(stress_ratings, measurevar="control", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# spaghetti plot
+ctrlSpaghetti <- ggplot(stress_ratings, aes(x=factor(run), y=control, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=ctrlCondRun_sumstats, aes(group=condition, x=run, y=control), size=1, colour="black") +
+  geom_errorbar(data=ctrlCondRun_sumstats, aes(ymin=control-se, ymax=control+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition, labeller=cond_labeller) +
+  scale_y_continuous(breaks=seq(0,100,10), limits=c(0, 100)) +
+  labs(y="Perceived Control", x="Run") +
+  scale_colour_manual(values=c(colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+ctrlSpaghetti
+```
+
+```{r manipulation checks - perceived control ratings - mixed models}
+# test whether perceived control ratings were higher in con compared to noc
+# maximal model
+ctrl.max <- mixed(control ~ condition*run.z + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(ctrl.max) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+ctrl.maxd <- lmer(control ~ condition*run.z + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+plot(ctrl.maxd)
+
+# plot random effects
+lattice::dotplot(ranef(ctrl.maxd))
+
+ctrl.results <- nice(ctrl.max)
+# sig. higher perceived control in con compared to noc
+# increasing perceived control over runs in con, decrease over runs in noc
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(ctrl.max,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Perceived Control"),
+          pred.labels = c("Intercept", 
+                          "Condition",
+                          "Run", 
+                          "Condition x Run"),
+          file = "../output/ctrl_model.html")
+```
+Participants reported higher perceived control under controllable trials compared to uncontrollable trials. Ratings increased over runs for controllable stress, but decreased for uncontrollable stress.
+
+# Ratings
+
+## Stress
+```{r stress ratings}
+# Hypothesis: a) higher stress ratings in both con and noc compared to baseline; b) lower stress ratings in con compared to noc - a) confirmed, b) disconfirmed, no difference
+
+# boxplot by condition and run
+stressBoxPlot <- ggplot(ratings, aes(factor(run), stress, fill=condition)) + 
+  geom_violin() +  
+  geom_boxplot(width=0.2, position=position_dodge(1)) +
+  labs(y="stress", x="run") +
+  scale_fill_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme()
+stressBoxPlot # no outliers
+
+# compute summary statistics for conditions
+stressCond_sumstats <- summarySEwithin2(ratings, measurevar="stress", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+stressCondRun_sumstats <- summarySEwithin2(ratings, measurevar="stress", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# spaghetti plot
+stressSpaghetti <- ggplot(ratings, aes(x=factor(run), y=stress, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=stressCondRun_sumstats, aes(group=condition, x=run, y=stress), size=1, colour="black") +
+  geom_errorbar(data=stressCondRun_sumstats, aes(ymin=stress-se, ymax=stress+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition) +
+  scale_y_continuous(breaks=seq(0,100,10), limits=c(0, 100)) +
+  labs(y="Stress", x="Run") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+stressSpaghetti
+```
+
+```{r stress ratings - mixed models}
+# test whether stress ratings differed between conditions
+
+ratings$run.z <- scale_this(ratings$run) # mean center run
+
+# maximal model
+stress.max <- mixed(stress ~ condition + (1+condition*run.z|id), data=ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(stress.max) # singular fit
+
+# remove correlation of random slopes and intercept
+stress.m1 <- mixed(stress ~ condition + (1+condition*run.z||id), data=ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(stress.m1) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(stress.m1)$varcor 
+
+# remove interaction of random slopes and add correlation again
+stress.m2 <- mixed(stress ~ condition + (1+condition+run.z|id), data=ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(stress.m2) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+stress.m2d <- lmer(stress ~ condition + (1+condition+run.z|id), data=ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+plot(stress.m2d)
+
+# plot random effects
+lattice::dotplot(ranef(stress.m2d))
+
+# compare maximal and reduced model
+stress.m2c <- update(stress.m2, REML=F); stress.maxc <- update(stress.max, REML=F)
+anova(stress.m2c, stress.maxc) # BIC suggests reduced model is better, whereas based on AIC maximum model should be favoured (but that one gave warnings)
+
+# compare results for maximal and reduced model
+stress.results <- left_join(nice(stress.max), nice(stress.m2), by = "Effect", suffix = c("_full", "_final")) # condition effect holds up no matter the model
+
+# post-hoc contrasts
+emm_stress <- emmeans(stress.m2, "condition")
+emm_stress
+update(pairs(emm_stress), by = NULL, adjust = "holm")
+# sig. higher stress ratings in stress compared to baseline, no sig. differences between con and noc
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(stress.m2,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Stress"),
+          pred.labels = c("Intercept", 
+                          "Condition-CON",
+                          "Condition-UNCON"),
+          file = "../output/stress_model.html")
+
+# include aversiveness ratings to test for interaction effects
+stress_ratings$aversiveness.z <- scale_this(stress_ratings$aversiveness) # mean center aversiveness ratings
+stress.m2avers <- mixed(stress ~ condition*aversiveness.z + (1+condition*aversiveness.z+run|id) + (1|run), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(stress.m2avers) # no interaction between condition and aversiveness
+```
+Participants reported higher stress levels in both stress conditions compared to baseline. There was no difference in stress ratings between controllable and uncontrollable stress trials.
+
+## Helplessness
+```{r helplessness ratings}
+# Hypothesis: lower helplessness ratings in con compared to noc - confirmed
+
+# boxplot by condition and run
+helpBoxPlot <- ggplot(stress_ratings, aes(factor(run), helplessness, fill=condition)) + 
+  geom_violin() +  
+  geom_boxplot(width=0.2, position=position_dodge(1)) +
+  labs(y="helplessness", x="run") +
+  scale_fill_manual(values=c(colour2, colour3)) +
+  laura_theme()
+helpBoxPlot
+
+# check for outliers by condition and run
+helpOutlier <- stress_ratings %>%
+  group_by(condition, run) %>%
+  identify_outliers(helplessness)
+
+# output extreme outliers
+helpOutlier <- helpOutlier[helpOutlier$is.extreme==T,] # none
+
+# compute summary statistics for conditions
+helpCond_sumstats <- summarySEwithin2(stress_ratings, measurevar="helplessness", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+helpCondRun_sumstats <- summarySEwithin2(stress_ratings, measurevar="helplessness", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# spaghetti plot
+helpSpaghetti <- ggplot(stress_ratings, aes(x=factor(run), y=helplessness, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=helpCondRun_sumstats, aes(group=condition, x=run, y=helplessness), size=1, colour="black") +
+  geom_errorbar(data=helpCondRun_sumstats, aes(ymin=helplessness-se, ymax=helplessness+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition) +
+  scale_y_continuous(breaks=seq(0,100,10), limits=c(0, 100)) +
+  labs(y="Helplessness", x="Run") +
+  scale_colour_manual(values=c(colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+helpSpaghetti
+```
+
+```{r helplessness ratings - mixed models}
+# test whether helplessness ratings differed between conditions
+# maximal model
+help.max <- mixed(helplessness ~ condition + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(help.max) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+help.maxd <- lmer(helplessness ~ condition + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000))) 
+plot(help.maxd) # model converged, no warnings
+
+# plot random effects
+lattice::dotplot(ranef(help.maxd))
+
+help.results <- nice(help.max)
+# sig. lower helplessness ratings in con compared to noc
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(help.max,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Helplessness"),
+          pred.labels = c("Intercept", 
+                          "Condition"),
+          file = "../output/help_model.html")
+```
+Participants reported feeling less helpless in controllable trials compared to uncontrollable trials.
+
+# Reaction Times (RT)
+
+```{r rt}
+# Hypothesis: longer RT in both con and noc compared to baseline; shorter RT in con compared to noc
+# --> results show SHORTER RT in con (and noc) compared to baseline; shorter RT in con compared to noc confirmed
+
+# boxplot by condition and run
+rtBoxPlot <- ggplot(stress, aes(factor(run), rt, fill=condition)) + 
+  geom_violin() +  
+  geom_boxplot(width=0.2, position=position_dodge(1)) +
+  labs(y="RT", x="run") +
+  scale_fill_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme()
+rtBoxPlot
+
+# check for outliers by condition and run
+rtOutlier <- stress %>%
+  group_by(condition, run) %>%
+  identify_outliers(rt)
+
+# output extreme outliers
+rtOutlier <- rtOutlier[rtOutlier$is.extreme==T,] # exclude id 35 run 4
+ 
+# exclude extreme outlier
+stressr <- stress %>% filter(! (id==35 & run==4))
+
+# compute summary statistics for conditions
+rtCond_sumstats <- summarySEwithin2(stressr, measurevar="rt", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+rtCondRun_sumstats <- summarySEwithin2(stressr, measurevar="rt", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# spaghetti plot
+rtSpaghetti <- ggplot(stressr, aes(x=factor(run), y=rt, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=rtCondRun_sumstats, aes(group=condition, x=run, y=rt), size=1, colour="black") +
+  geom_errorbar(data=rtCondRun_sumstats, aes(ymin=rt-se, ymax=rt+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition) +
+  labs(y="Reaction Time (ms)", x="Run") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+rtSpaghetti
+```
+
+```{r rt - mixed models}
+# test whether RTs differed between conditions
+
+stressr$run.z <- scale_this(stressr$run) # mean center run
+
+# maximal model
+rt.max <- mixed(rt ~ condition + (1+condition*run.z|id), data=stressr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(rt.max) # singular fit
+
+# remove correlation of random slopes and intercepts by id
+rt.m1 <- mixed(rt ~ condition + (1+condition*run||id), data=stressr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(rt.m1) # singular fit
+
+# remove interaction of random slopes
+rt.m2 <- mixed(rt ~ condition + (1+condition+run||id), data=stressr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(rt.m2) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(rt.m2)$varcor
+
+# remove random slopes for condition and add correlation again
+rt.m3 <- mixed(rt ~ condition + (1+run|id), data=stressr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(rt.m3) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+rt.m3d <- lmer(rt ~ condition + (1+run|id), data=stressr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+plot(rt.m3d)
+
+# plot random effects
+lattice::dotplot(ranef(rt.m3d))
+
+# compare maximal and reduced model
+rt.m3c <- update(rt.m3, REML=F); rt.maxc <- update(rt.max, REML=F)
+anova(rt.m3c, rt.maxc) # reduced model fits better
+
+# compare results for maximal and reduced model
+rt.results <- left_join(nice(rt.max), nice(rt.m3), by = "Effect", suffix = c("_full", "_final")) 
+
+# post-hoc contrasts
+emm_rt <- emmeans(rt.m3, "condition")
+emm_rt
+update(pairs(emm_rt), by = NULL, adjust = "holm")
+# shorter RTs in con compared to both noc and bas, slightly shorter RTs in noc compared to baseline
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(rt.m3,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Reaction Times"),
+          pred.labels = c("Intercept", 
+                          "Condition-CON",
+                          "Condition-UNCON"),
+          file = "../output/rt_model.html")
+```
+Reaction times were shorter under stress compared to baseline. Further, participants responded faster in the controllable condition compared to the uncontrollable condition. 
+
+# Correct Responses
+
+```{r correct responses}
+# Hypothesis: lower rate of correct responses in con and noc compared to baseline; higher rate of correct responses in con compared to noc
+# --> results show higher rate of correct responses in both stress conditions compared to baseline, performance in con is sig. higher than in noc
+
+# check if participants pressed more than one button
+#levels(stress$Button_pressed)
+#stress$id[stress$Button_pressed=="[3, 1]"] # only 1 case, id 23
+stress$Button_pressed[stress$Button_pressed=="[3, 1]"] <- 3 # keep only first button press
+
+# create variable for correct responses based on button pressed and target (misses are lumped together with false responses)
+stress$Button_pressed <- gsub("\\[|\\]", "", stress$Button_pressed) # remove square brackets
+stress <- stress %>% mutate(correct = case_when(Target == Button_pressed ~ 1,
+                                          (Target != Button_pressed) ~ 0))
+
+# get mean scores per id, condition, and run
+stressM <- stress %>% group_by(id, condition, run) %>%  summarise_all(funs(mean(., na.rm = TRUE)))
+
+# boxplot by condition and run
+corrBoxPlot <- ggplot(stressM, aes(factor(run), correct, fill=condition)) + 
+  geom_violin() +  
+  geom_boxplot(width=0.2, position=position_dodge(1)) +
+  labs(y="correct", x="run") +
+  scale_fill_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme()
+corrBoxPlot # some outliers
+
+# check for outliers by condition and run
+corrOutlier <- stressM %>%
+  group_by(condition, run) %>%
+  identify_outliers(correct)
+
+# output extreme outliers
+corrOutlier <- corrOutlier[corrOutlier$is.extreme==T, c(1:3, 15:17)] 
+
+# exclude extreme outliers
+stressc <- stress[! (stress$id=="6" | 
+           (stress$id=="34" & stress$run==2) | 
+           (stress$id=="7" & stress$run==3) | 
+           (stress$id=="51" & stress$run==4) |
+           (stress$id=="18" & stress$run==4)), ] 
+
+stressM <- stressc %>% group_by(id, condition, run) %>%  summarise_all(funs(mean(., na.rm = TRUE))) # correct means
+
+# compute summary statistics for conditions
+corrCond_sumstats <- summarySEwithin2(stressM, measurevar="correct", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+corrCondRun_sumstats <- summarySEwithin2(stressM, measurevar="correct", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# global mean
+correct.m <- mean(stressM$correct)
+correct.sd <- sd(stressM$correct)
+
+# spaghetti plot
+corrSpaghetti <- ggplot(stressM, aes(x=factor(run), y=correct, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=corrCondRun_sumstats, aes(group=condition, x=run, y=correct), size=1, colour="black") +
+  geom_errorbar(data=corrCondRun_sumstats, aes(ymin=correct-se, ymax=correct+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition) +
+  scale_y_continuous(breaks=seq(0,1,.1), limits=c(0, 1)) +
+  labs(y="Correct", x="Run") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+corrSpaghetti
+```
+
+```{r correct responses - mixed models}
+# test whether performance differed between conditions
+
+stressc$run.z <- scale_this(stressc$run) # mean center run
+
+# maximal model
+corr.max <- mixed(correct ~ condition + (1+condition*run.z|id), data=stressc, family = binomial, method="LRT",
+                  control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(corr.max) # singular fit              
+
+# remove correlation of random slopes and intercepts by id
+corr.m1 <- mixed(correct ~ condition + (1+condition*run.z||id), data=stressc, family = binomial, method="LRT",
+                  control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(corr.m1) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(corr.m1)$varcor
+
+# remove random slopes for condition and add correlation again
+corr.m2 <- mixed(correct ~ condition + (1+run.z|id), data=stressc, family = binomial, method="LRT",
+                  control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(corr.m2) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+corr.m2d <- glmer(correct ~ condition + (1+run|id), data=stressc, family = binomial,
+                  control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+plot(corr.m2d) # ceiling effect?!
+
+# plot random effects
+lattice::dotplot(ranef(corr.m2d))
+
+# compare maximal and reduced model
+corr.m2c <- update(corr.m2, REML=F); corr.maxc <- update(corr.max, REML=F)
+anova(corr.m2c, corr.maxc) # reduced model fits better but no sig. difference
+
+# compare results for maximal and reduced model
+corr.results <- left_join(nice(corr.max), nice(corr.m2), by = "Effect", suffix = c("_full", "_final")) 
+
+# post-hoc cntrasts
+emm_corr <- emmeans(corr.m2, "condition")
+emm_corr
+update(pairs(emm_corr), by = NULL, adjust = "holm")
+# higher rate of correct responses in con and noc compared to baseline, performance in con is also sig. better than in noc
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(corr.m2,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Correct Responses"),
+          pred.labels = c("Intercept", 
+                          "Condition-CON",
+                          "Condition-UNCON"),
+          file = "../output/corr_model.html")
+```
+Performance was significantly better (higher rate of correct responses) under stress compared to baseline. Further, participants responded correctly more often in the controllable condition compared to the uncontrollable condition. 
+
+# Heart Rate (HR)
+
+```{r hr}
+# INFO: no data for ids 15 and 33, some participants are missing runs (s. PulseDataOverview.csv for details)
+# Hypothesis: higher HR in con and noc compared to baseline; lower HR in con compared to noc
+
+# boxplot by condition and run
+hrBoxPlot <- ggplot(hr, aes(factor(run), bpm, fill=condition)) + 
+  geom_violin() +  
+  geom_boxplot(width=0.2, position=position_dodge(1)) +
+  labs(y="bpm", x="run") +
+  scale_fill_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme()
+hrBoxPlot # some outliers
+
+# get outlier ids
+hrOutlier <- hr %>%
+  group_by(condition, run) %>%
+  identify_outliers(bpm)
+
+# output extreme outliers
+hrOutlier <- hrOutlier[hrOutlier$is.extreme==T,]
+
+# exclude extreme outliers
+hr <- hr[! (hr$id=="24" | 
+           (hr$id=="45" & hr$run==3) | 
+           (hr$id=="6" & hr$run==1)), ] 
+
+# compute summary statistics for conditions
+hrCond_sumstats <- summarySEwithin2(hr, measurevar="bpm", withinvars="condition", idvar="id", conf.interval=.95, na.rm=T) 
+
+# compute summary statistics for conditions and runs
+hrCondRun_sumstats <- summarySEwithin2(hr, measurevar="bpm", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# spaghetti plot
+hrSpaghetti <- ggplot(hr, aes(x=factor(run), y=bpm, colour=condition)) +
+  geom_line(aes(group=id), size=1, alpha=.5) +
+  geom_line(data=hrCondRun_sumstats, aes(group=condition, x=run, y=bpm), size=1, colour="black") +
+  geom_errorbar(data=hrCondRun_sumstats, aes(ymin=bpm-se, ymax=bpm+se), size=1, width =.2, colour="black") +
+  facet_wrap(~condition) +
+  labs(y="Heart Rate (bpm)", x="Run") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  laura_theme() + theme(legend.position="none")
+hrSpaghetti
+```
+
+```{r hr - mixed models}
+# test whether HR differed between conditions
+
+hr$run.z <- scale_this(hr$run)
+
+# maximal model
+hr.max <- mixed(bpm ~ condition + (1+condition*run|id), data=hr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(hr.max) # singular fit
+
+# remove correlation of random slopes and intercepts by id
+hr.m1 <- mixed(bpm ~ condition + (1+condition*run.z||id), data=hr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(hr.m1) # singular fit
+
+# remove random slopes for condition
+hr.m2 <- mixed(bpm ~ condition + (1+condition+run||id), data=hr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
+summary(hr.m2) # model converged, no warnings
+
+# print random effects terms to inform further model reduction
+summary(hr.m2)$varcor
+
+# remove random slopes for condition and add correlation again
+hr.m3 <- mixed(bpm ~ condition + (1+run|id), data=hr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(hr.m3) # model converged, no warnings
+
+# diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
+hr.m3d <- lmer(bpm ~ condition + (1+run|id), data=hr, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+plot(hr.m3d)
+
+# plot random effects
+lattice::dotplot(ranef(hr.m3d))
+
+# compare maximal and reduced model
+hr.m3c <- update(hr.m3, REML=F); hr.maxc <- update(hr.max, REML=F)
+anova(hr.m3c, hr.maxc) # reduced model fits better, but no sig. difference
+
+# compare results for maximal and reduced model
+hr.results <- left_join(nice(hr.max), nice(hr.m3), by = "Effect", suffix = c("_full", "_final")) # condition effect only in reduced model
+
+# post-hoc contrasts
+emm_hr <- emmeans(hr.m3, "condition")
+emm_hr
+update(pairs(emm_hr), by = NULL, adjust = "holm")
+# HR is sig. higher con compared to bas, no other sig. contrasts
+
+# save table with model details
+tab_model(hr.m3,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Heart Rate"),
+          pred.labels = c("Intercept", 
+                          "Condition-CON",
+                          "Condition-UNCON"),
+          file = "../output/hr_model.html")
+```
+Heart rates were higher under controllable stress compared to baseline. No other contrasts were significant.
+
+# MR Parameter Estimates
+
+```{r plot MR parameter estimates}
+# compute summary statistics for conditions and runs
+betasCondRun_sumstats <- summarySEwithin2(betas, measurevar="beta_weight", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
+
+# bar plot
+betasBar <- ggplot(betasCondRun_sumstats, aes(x=run, y=beta_weight, fill=condition)) +
+  geom_bar(stat="identity", position="dodge", colour="black") + 
+  geom_errorbar(aes(ymin=beta_weight-se, ymax=beta_weight+se), position=position_dodge(0.9), size=1, width =.2, colour="black") +
+  labs(y="Parameter Estimates", x="Run") +
+  laura_theme() +
+  scale_fill_manual(values=c(colour2, colour3), labels=c("CON", "UNCON"))
+betasBar
+```
+
+## Does vmPFC activation modulate ratings? 
+
+```{r MR parameter estimates}
+# include beta weights in models
+stress_ratings$beta_weight.z <- scale_this(stress_ratings$beta_weight) # mean center beta weights
+
+# stress
+stress.m2Beta <- mixed(stress ~ condition*beta_weight.z + (1+condition+run.z|id), data=stress_ratings, method = "S", 
+                       control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(stress.m2Beta) # no modulation
+
+stressBeta.results <- nice(stress.m2Beta)
+
+# helplessness
+help.maxBeta <- mixed(helplessness ~ condition*beta_weight.z + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(help.maxBeta) # sig. interaction
+
+helpBeta.results <- nice(help.maxBeta)
+
+# save table with model details (includes confidence intervals, marginal and conditional R2)
+tab_model(help.maxBeta,
+          string.ci = "95% CI",
+          dv.labels = c("Fixed Effects - Helplessness"),
+          pred.labels = c("Intercept", 
+                          "Condition",
+                          "Beta Weight",
+                          "Condition x Beta Weight"),
+          file = "../output/helpBeta_model.html")
+
+helpBetaPlot <- ggplot(stress_ratings, aes(x=beta_weight, y=helplessness)) +
+  geom_point(stat="identity") + 
+  geom_smooth(method="lm", colour="black") +
+  facet_wrap(~condition, labeller=cond_labeller) +
+  labs(y="Helplessness", x="Parameter Estimates") +
+  coord_cartesian(ylim = c(0, 100)) +
+  laura_theme()
+helpBetaPlot
+```
+VmPFC activation modulated helplessness ratings for uncontrollable stress, not for controllable stress. For uncontrollable stress, higher beta weights were linked to lower helplessness ratings.
+
+# Correction for Multiple Dependent Variables
+
+```{r correcting for multiple dependent variables}
+# Controllability effect
+# get p-values from relevant tests (con vs. noc)
+DV <- c("stress", "helplessness", "RT", "correct", "hr")
+p.orig <- c(.0845, .0001, .0001, .0069, .1159 ) # p-values in order of DVs
+correction <- data.frame(DV, p.orig)
+correction <- correction[order(correction$p.orig),] # order by p-value
+
+# calculate FWER-correction 
+correction$Bonferroni <- p.adjust(correction$p.orig, method="bonferroni") # multiplies p-value by number of tests
+correction
+
+# no changes
+```
+
+# Figures for Paper
+
+```{r figures}
+# compute summary statistics for id and condition
+ratingsM <- ratings %>% group_by(id, condition) %>%  summarise_all(funs(mean(., na.rm = TRUE)))
+stress_ratingsM <- stress_ratings %>% group_by(id, condition) %>%  summarise_all(funs(mean(., na.rm = TRUE)))
+stressMplot <- stress %>% group_by(id, condition) %>%  summarise_all(funs(mean(., na.rm = TRUE)))
+hrM <- hr %>% group_by(id, condition) %>%  summarise_all(funs(mean(., na.rm = TRUE)))
+
+# stress
+figStress <- ggplot(ratingsM, aes(x=condition, y=stress, colour=condition)) + 
+  geom_point(size=5, position=position_dodge2(width=.5), alpha=0.7) +
+  geom_point(data=stressCond_sumstats, aes(y=stress), colour = "black", size=5) +
+  geom_errorbar(data=stressCond_sumstats, aes(y=stress, ymin=stress-sd, ymax=stress+sd),
+                    colour="black", width=0.1, size=1) +
+  scale_y_continuous(breaks=seq(0,100,10), limits=c(0,110)) +
+  scale_x_discrete(labels=c("Baseline", "CON", "UNCON")) +
+  labs(y="Stress", x="") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  annotate("rect", xmin=1, xmax=2, ymin=108, ymax=108, colour="black", size=0.8) + # add sig. line for bas - con
+  annotate("rect", xmin=1, xmax=3, ymin=98, ymax=98, colour="black", size=0.8) + # add sig. line for bas - noc
+  annotate("rect", xmin=2, xmax=3, ymin=90, ymax=90, colour="black", size=0.8) + # add sig. line for con - noc
+  annotate("text", x=1.5, y=109, label="***", cex=8) + # add asterisks for bas - con
+  annotate("text", x=2, y=99, label="***", cex=8) + # add asterisks bas - noc
+  annotate("text", x=2.5, y=94, label="NS.", cex=6) + # add asterisks con - noc
+  laura_theme() + theme(legend.position="none")
+figStress
+
+# helplessness
+figHelp <- ggplot(stress_ratingsM, aes(x=condition, y=helplessness, colour=condition)) + 
+  geom_point(size=5, position=position_dodge2(width=.5), alpha=0.7) +
+  geom_point(data=helpCond_sumstats, aes(y=helplessness), colour = "black", size=5) +
+  geom_errorbar(data=helpCond_sumstats, aes(y=helplessness, ymin=helplessness-sd, ymax=helplessness+sd),
+                    colour="black", width=0.1, size=1) +
+  scale_y_continuous(breaks=seq(0,100,10), limits=c(0,110)) +
+  scale_x_discrete(labels=c("CON", "UNCON")) +
+  labs(y="Helplessness", x="") +
+  scale_colour_manual(values=c(colour2, colour3)) +
+  annotate("rect", xmin=1, xmax=2, ymin=108, ymax=108, colour="black", size=0.8) + # add sig. line
+  annotate("text", x=1.5, y=109, label="***", cex=8) + # add asterisks
+  laura_theme() + theme(legend.position="none")
+figHelp
+
+# rt
+figRT <- ggplot(stressMplot, aes(x=condition, y=rt, colour=condition)) + 
+  geom_point(size=5, position=position_dodge2(width=.5), alpha=0.7) +
+  geom_point(data=rtCond_sumstats, aes(y=rt), colour = "black", size=5) +
+  geom_errorbar(data=rtCond_sumstats, aes(y=rt, ymin=rt-sd, ymax=rt+sd),
+                    colour="black", width=0.1, size=1) +
+  scale_y_continuous(breaks=seq(600,1000,100), limits=c(600,1000)) +
+  scale_x_discrete(labels=c("Baseline", "CON", "UNCON")) +
+  labs(y="Reaction Time (ms)", x="") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  annotate("rect", xmin=1, xmax=2, ymin=998, ymax=998, colour="black", size=0.8) + # add sig. line or bas - con
+  annotate("rect", xmin=1, xmax=3, ymin=968, ymax=968, colour="black", size=0.8) + # add sig. line or bas - noc
+  annotate("rect", xmin=2, xmax=3, ymin=938, ymax=938, colour="black", size=0.8) + # add sig. line for con - noc
+  annotate("text", x=1.5, y=999, label="***", cex=8) + # add asterisks or bas - con
+  annotate("text", x=2, y=969, label="*", cex=8) + # add asterisks or bas - noc
+  annotate("text", x=2.5, y=939, label="***", cex=8) + # add asterisks or con - con
+  laura_theme() + theme(legend.position="none")
+figRT
+
+# correct
+figCorr <- ggplot(stressMplot, aes(x=condition, y=correct, colour=condition)) + 
+  geom_point(size=5, position=position_dodge2(width=.5), alpha=0.7) +
+  geom_point(data=corrCond_sumstats, aes(y=correct), colour = "black", size=5) +
+  geom_errorbar(data=corrCond_sumstats, aes(y=correct, ymin=correct-sd, ymax=correct+sd),
+                    colour="black", width=0.1, size=1) +
+  scale_y_continuous(breaks=seq(0.3,1,0.1), limits=c(0.3,1.3)) +
+  scale_x_discrete(labels=c("Baseline", "CON", "UNCON")) +
+  labs(y="Correct Responses", x="") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  annotate("rect", xmin=1, xmax=2, ymin=1.28, ymax=1.28, colour="black", size=0.8) + # add sig. line or bas - con
+  annotate("rect", xmin=1, xmax=3, ymin=1.18, ymax=1.18, colour="black", size=0.8) + # add sig. line or bas - noc
+  annotate("rect", xmin=2, xmax=3, ymin=1.08, ymax=1.08, colour="black", size=0.8) + # add sig. line for con - noc
+  annotate("text", x=1.5, y=1.29, label="***", cex=8) + # add asterisks or bas - con
+  annotate("text", x=2, y=1.19, label="**", cex=8) + # add asterisks or bas - noc
+  annotate("text", x=2.5, y=1.09, label="**", cex=8) + # add asterisks or con - con
+  laura_theme() + theme(legend.position="none")
+figCorr
+
+# heart rate
+figHR <- ggplot(hrM, aes(x=condition, y=bpm, colour=condition)) + 
+  geom_point(size=5, position=position_dodge2(width=.5), alpha=0.7) +
+  geom_point(data=hrCond_sumstats, aes(y=bpm), colour = "black", size=5) +
+  geom_errorbar(data=hrCond_sumstats, aes(y=bpm, ymin=bpm-sd, ymax=bpm+sd),
+                    colour="black", width=0.1, size=1) +
+  scale_y_continuous(breaks=seq(30,100,10), limits=c(30,110)) +
+  scale_x_discrete(labels=c("Baseline", "CON", "UNCON")) +
+  labs(y="Heart Rate (bpm)", x="") +
+  scale_colour_manual(values=c(colour1, colour2, colour3)) +
+  annotate("rect", xmin=1, xmax=2, ymin=108, ymax=108, colour="black", size=0.8) + # add sig. line or bas - con
+  annotate("rect", xmin=1, xmax=3, ymin=100, ymax=100, colour="black", size=0.8) + # add sig. line or bas - noc
+  annotate("rect", xmin=2, xmax=3, ymin=92, ymax=92, colour="black", size=0.8) + # add sig. line for con - noc
+  annotate("text", x=1.5, y=109, label="***", cex=8) + # add asterisks or bas - con
+  annotate("text", x=2, y=103, label="NS.", cex=6) + # add asterisks or bas - noc
+  annotate("text", x=2.5, y=95, label="NS.", cex=6) + # add asterisks or con - con
+  laura_theme() + theme(legend.position="none")
+figHR
+```
