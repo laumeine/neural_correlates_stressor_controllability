@@ -50,11 +50,11 @@ scale_this <- function(x) as.vector(scale(x))
 ```
 
 ```{r import, format and merge data}
-demo_notes <- read.csv("../anonymized_data/demo_notes.csv", header=T, sep=",")
-stress <- read.csv("../anonymized_data/controllability_task.csv", header=T, sep=",")
-ratings <- read.csv("../anonymized_data/ratings.csv", header=T, sep=",")
-betas <- read.csv("../anonymized_data/MR_betas.csv", header=T, sep=",") 
-hr <- read.table("../anonymized_data/heart_rate.csv", header=T, sep=",")
+demo_notes <- read.csv("../anonymised_data/demo_notes.csv", header=T, sep=",")
+stress <- read.csv("../anonymised_data/controllability_task.csv", header=T, sep=",")
+ratings <- read.csv("../anonymised_data/ratings.csv", header=T, sep=",")
+betas <- read.csv("../anonymised_data/MR_betas.csv", header=T, sep=",") 
+hr <- read.table("../anonymised_data/heart_rate.csv", header=T, sep=",")
 
 # merge data.frames to relate data
 ratings <- list(ratings, betas) %>% reduce(left_join, by = c("id", "run", "condition"))
