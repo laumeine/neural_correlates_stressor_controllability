@@ -1,5 +1,5 @@
 ---
-title: "Analyses for 'Neural Correlates of Stressor Controllability in Humans'"
+title: "Analyses for 'Don't Stress, It's Under Control: Neural Correlates of Stressor Controllability in Humans'"
 author: "Laura E. Meine & Jana Meier"
 date: "28.10.2020"
 output:
