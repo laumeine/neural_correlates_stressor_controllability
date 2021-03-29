@@ -1,7 +1,7 @@
 ---
 title: "Analyses for 'Don't Stress, It's Under Control: Neural Correlates of Stressor Controllability in Humans'"
 author: "Laura E. Meine & Jana Meier"
-date: "28.10.2020"
+date: "18.02.2021"
 output:
   html_document:
     number_sections: yes
@@ -52,8 +52,10 @@ scale_this <- function(x) as.vector(scale(x))
 ```{r import, format and merge data}
 demo_notes <- read.csv("../anonymised_data/demo_notes.csv", header=T, sep=",")
 stress <- read.csv("../anonymised_data/controllability_task.csv", header=T, sep=",")
+stress <- stress %>%
+  mutate(Stress_duration = case_when(condition == "bas" ~ 0, condition != "bas" ~ Stress_duration)) # set stress durations to zero for baseline condition
 ratings <- read.csv("../anonymised_data/ratings.csv", header=T, sep=",")
-betas <- read.csv("../anonymised_data/MR_betas.csv", header=T, sep=",") 
+betas <- read.csv("../anonymised_data/MR_betas.csv", header=T, sep="\t") 
 hr <- read.table("../anonymised_data/heart_rate.csv", header=T, sep=",")
 
 # merge data.frames to relate data
@@ -86,8 +88,6 @@ demo_notes <- demo_notes %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36
 stress <- stress %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
 ratings <- ratings %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
 hr <- hr %>% filter(! (id==12 | id==3 | id==11 | id==27 | id==36 | id==2 | id==29))
-
-stress_ratings <- ratings %>% filter(condition!="bas") %>% droplevels() # aversiveness, perceived control, and helplessness only rated in con and noc
 ```
 
 # Sample Descriptives
@@ -119,12 +119,14 @@ stressDur <- stress %>%
   group_by(id)  %>%
   summarise(total_con_stress_dur = mean(total_con_stress_dur),
             total_noc_stress_dur = mean(total_noc_stress_dur),
-            diff = total_con_stress_dur - total_noc_stress_dur)
+            stress_dur_diff = total_con_stress_dur - total_noc_stress_dur)
 
 t.test(stressDur$total_con_stress_dur, stressDur$total_noc_stress_dur, paired=T) 
 cohen.d(stressDur$total_con_stress_dur, stressDur$total_noc_stress_dur) # get cohen's d
 # imperfect yoking, slightly longer overall stress duration in con compared to noc
 # mean of the differences in stress duration was 1.73s 
+
+sd(stressDur$stress_dur_diff) # get standard deviation
 
 # check whether participants perceived any difference - update: 2 already excluded!
 nPerceivedDiff <- demo_notes %>%
@@ -137,8 +139,19 @@ CondMoreShocks <- mutate(demo_notes) %>%
   summarise(nMoreShocksCon = sum(condition_more_shocks=="1"), # 2 thought they received more shocks in con - already excluded
             nMoreShocksNoc = sum(condition_more_shocks=="2"), # 19 thought they received more shocks in noc
             dontKnow = nPerceivedDiff[1] - (nMoreShocksCon + nMoreShocksNoc)) # 1 couldn't tell
+
+# add stress duration difference score to ratings
+ratings <- list(ratings, stressDur[, c(1,4)]) %>% reduce(left_join, by = "id")
+
+# format and extract stress durations to include as covariate in fMRI analysis
+cov <- stress %>%
+  group_by(id, run, condition)  %>% 
+  summarise(total_stress_dur = sum(Stress_duration)) %>% 
+  mutate(condition =  factor(condition, levels = c("con", "noc", "bas"))) %>% # order rows to match GLM setup for fMRI analysis
+  arrange(id, run, condition) 
+write.table(cov[, 4], "../anonymised_data/stressDur.csv", sep="\t", col.names=F, row.names=F)
 ```
-There was a significant difference in overall stress duration between conditions, yoking did not work out properly. Participants were on average exposed to LESS stress in the uncontrollable condition but reported experiencing no difference or even MORE stress in this condition when asked afterwards. Therefore, effects showing greater performance decrements associated with uncontrollable stress cannot be attributed to more stress. Nevertheless, this remains a limitation.
+There was a significant difference in overall stress duration between conditions, yoking did not work out properly. Participants were on average exposed to LESS stress in the uncontrollable condition but reported experiencing no difference or even MORE stress in this condition when asked afterwards. Therefore, effects showing greater performance decrements associated with uncontrollable stress cannot be attributed to more stress. Nevertheless, this remains a limitation and the CON-UNCON stress duration difference is therefore included as a covariate in subsequent analyses.
 
 ## Stressor Aversiveness
 ```{r manipulation checks - stressor aversiveness}
@@ -154,7 +167,8 @@ aversHist
 initAversLow <- aversHist$data$id[aversHist$data$initial_aversiveness<25] # get their ids: 27,8,36,14
 
 # check aversiveness ratings during experiment (expectation: consistently high  ratings across runs)
-aversLow <- stress_ratings %>% filter(! condition=="bas" & aversiveness<25) %>% 
+stress_ratings <- ratings %>% filter(condition!="bas") %>% droplevels() # aversiveness, perceived control, and helplessness only rated in con and noc
+aversLow <- stress_ratings %>% filter(! aversiveness<25) %>% 
   group_by(id) %>% summarise(count = n()) %>% filter(count > 4) # ids 27, 36, 2 rated <25 in more than half the runs - update: already excluded
 
 # compute summary statistics for conditions
@@ -185,14 +199,15 @@ aversSpaghetti
 # test whether aversiveness ratings differed between con and noc and whether there were changes over runs
 
 stress_ratings$run.z <- scale_this(stress_ratings$run) # mean center run
+stress_ratings$stress_dur_diff.z <- scale_this(stress_ratings$stress_dur_diff) # mean center stress dur difference
 
 # maximal model
-avers.max <- mixed(aversiveness ~ condition*run.z + (1+condition*run.z|id), data=stress_ratings, method = "S",
+avers.max <- mixed(aversiveness ~ condition*run.z + (1+condition*run.z+stress_dur_diff.z|id), data=stress_ratings, method = "S",
                    control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(avers.max) # singular fit
 
 # remove correlation of random slopes and intercepts
-avers.m1 <- mixed(aversiveness ~ condition*run.z + (1+condition*run.z||id), data=stress_ratings, method = "S",
+avers.m1 <- mixed(aversiveness ~ condition*run.z + (1+condition*run.z+stress_dur_diff.z||id), data=stress_ratings, method = "S",
                   control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(avers.m1) # singular fit
 
@@ -200,32 +215,37 @@ summary(avers.m1) # singular fit
 summary(avers.m1)$varcor 
 
 # remove interaction of random slopes
-avers.m2 <- mixed(aversiveness ~ condition*run.z + (1+condition+run.z||id), data=stress_ratings, method = "S",
+avers.m2 <- mixed(aversiveness ~ condition*run.z + (1+condition+run.z+stress_dur_diff.z||id), data=stress_ratings, method = "S",
                   control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(avers.m2) # singular fit
 
 # print random effects terms to inform further model reduction
 summary(avers.m2)$varcor 
 
-# remove random slopes for condition and add correlation again
-avers.m3 <- mixed(aversiveness ~ condition*run.z + (1+run.z|id), data=stress_ratings, method = "S",
+# remove random slopes for condition
+avers.m3 <- mixed(aversiveness ~ condition*run.z + (1+run.z+stress_dur_diff.z||id), data=stress_ratings, method = "S",
                   control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(avers.m3) # model converged, no warnings
+summary(avers.m3) # singular fit
+
+# remove random slopes for stress duration difference
+avers.m4 <- mixed(aversiveness ~ condition*run.z + (1+run.z|id), data=stress_ratings, method = "S",
+                  control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(avers.m4) # model converged, no warnings
 
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-avers.m3d <- lmer(aversiveness ~ condition*run.z + (1+run.z|id), data=stress_ratings, method = "S",
+avers.m4d <- lmer(aversiveness ~ condition*run.z + (1+run.z|id), data=stress_ratings, method = "S",
                   control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-plot(avers.m3d)
+plot(avers.m4d)
 
 # plot random effects
-lattice::dotplot(ranef(avers.m3d))
+lattice::dotplot(ranef(avers.m4d))
 
 # compare maximal and reduced model
-avers.m3c <- update(avers.m3, REML=F); avers.maxc <- update(avers.max, REML=F)
-anova(avers.m3c, avers.maxc) # AIC and BIC indicate better fit for reduced model, but no sig difference
+avers.m4c <- update(avers.m4, REML=F); avers.maxc <- update(avers.max, REML=F)
+anova(avers.m4c, avers.maxc) # AIC and BIC indicate better fit for reduced model, but no sig. difference
 
 # compare results for maximal and reduced model
-avers.results <- left_join(nice(avers.max), nice(avers.m3), by = "Effect", suffix = c("_full", "_final")) # results are very similar
+avers.results <- left_join(nice(avers.max), nice(avers.m4), by = "Effect", suffix = c("_full", "_final")) # results are very similar
 
 # no differences in aversiveness between conditions
 avers.m <- mean(aversCond_sumstats$aversiveness) # global mean rating
@@ -233,7 +253,7 @@ avers.m <- mean(aversCond_sumstats$aversiveness) # global mean rating
 # decreasing aversiveness over runs, evidence for habituation
 
 # save table with model details (includes confidence intervals, marginal and conditional R2)
-tab_model(avers.m3,
+tab_model(avers.m4,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Stressor Aversiveness"),
           pred.labels = c("Intercept", 
@@ -284,30 +304,57 @@ ctrlSpaghetti
 
 ```{r manipulation checks - perceived control ratings - mixed models}
 # test whether perceived control ratings were higher in con compared to noc
+
 # maximal model
-ctrl.max <- mixed(control ~ condition*run.z + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+ctrl.max <- mixed(control ~ condition*run.z + (1+condition*run.z+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(ctrl.max) # model converged, no warnings
+summary(ctrl.max) # singular fit
+
+# remove correlation of random slopes and intercepts
+ctrl.m1 <- mixed(control ~ condition*run.z + (1+condition*run.z+stress_dur_diff.z||id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(ctrl.m1) # model failed to converge
+
+# print random effects terms to inform further model reduction
+summary(ctrl.m1)$varcor 
+
+# remove interaction of random slopes
+ctrl.m2 <- mixed(control ~ condition*run.z + (1+condition+run.z+stress_dur_diff.z||id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(ctrl.m2) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(ctrl.m2)$varcor 
+
+# remove random slopes for stress duration difference and add correlation again
+ctrl.m3 <- mixed(control ~ condition*run.z + (1+condition+run.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(ctrl.m3) # model converged, no warnings
 
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-ctrl.maxd <- lmer(control ~ condition*run.z + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+ctrl.m3d <- lmer(control ~ condition*run.z + (1+condition+run.z|id), data=stress_ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-plot(ctrl.maxd)
+plot(ctrl.m3d)
 
 # plot random effects
-lattice::dotplot(ranef(ctrl.maxd))
+lattice::dotplot(ranef(ctrl.m3d))
 
-ctrl.results <- nice(ctrl.max)
+# compare maximal and reduced model
+ctrl.m3c <- update(ctrl.m3, REML=F); ctrl.maxc <- update(ctrl.max, REML=F)
+anova(ctrl.m3c, ctrl.maxc) # BIC suggests reduced model is better, whereas based on AIC maximum model should be favoured (but that one gave warnings)
+
+# compare results for maximal and reduced model
+ctrl.results <- left_join(nice(ctrl.max), nice(ctrl.m3), by = "Effect", suffix = c("_full", "_final")) # results are very similar
+
 # sig. higher perceived control in con compared to noc
-# increasing perceived control over runs in con, decrease over runs in noc
 
 # save table with model details (includes confidence intervals, marginal and conditional R2)
-tab_model(ctrl.max,
+tab_model(ctrl.m3,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Perceived Control"),
-          pred.labels = c("Intercept", 
+          pred.labels = c("Intercept",
                           "Condition",
-                          "Run", 
+                          "Run",
                           "Condition x Run"),
           file = "../output/ctrl_model.html")
 ```
@@ -351,48 +398,57 @@ stressSpaghetti
 # test whether stress ratings differed between conditions
 
 ratings$run.z <- scale_this(ratings$run) # mean center run
+ratings$stress_dur_diff.z <- scale_this(ratings$stress_dur_diff) # mean center stress duration difference
 
 # maximal model
-stress.max <- mixed(stress ~ condition + (1+condition*run.z|id), data=ratings, method = "S", 
+stress.max <- mixed(stress ~ condition + (1+condition*run.z + stress_dur_diff.z|id), data=ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(stress.max) # singular fit
 
 # remove correlation of random slopes and intercept
-stress.m1 <- mixed(stress ~ condition + (1+condition*run.z||id), data=ratings, method = "S", 
+stress.m1 <- mixed(stress ~ condition + (1+condition*run.z+stress_dur_diff.z||id), data=ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(stress.m1) # singular fit
 
 # print random effects terms to inform further model reduction
 summary(stress.m1)$varcor 
 
-# remove interaction of random slopes and add correlation again
-stress.m2 <- mixed(stress ~ condition + (1+condition+run.z|id), data=ratings, method = "S", 
+# remove interaction of random slopes
+stress.m2 <- mixed(stress ~ condition + (1+condition+run.z+stress_dur_diff.z||id), data=ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(stress.m2) # model converged, no warnings
+summary(stress.m2) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(stress.m2)$varcor 
+
+# remove random slopes for stress duration difference and add correlation again
+stress.m3 <- mixed(stress ~ condition + (1+condition+run.z|id), data=ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(stress.m3) # model converged, no warnings
 
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-stress.m2d <- lmer(stress ~ condition + (1+condition+run.z|id), data=ratings, method = "S", 
+stress.m3d <- lmer(stress ~ condition + (1+condition+run.z|id), data=ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-plot(stress.m2d)
+plot(stress.m3d)
 
 # plot random effects
-lattice::dotplot(ranef(stress.m2d))
+lattice::dotplot(ranef(stress.m3d))
 
 # compare maximal and reduced model
-stress.m2c <- update(stress.m2, REML=F); stress.maxc <- update(stress.max, REML=F)
-anova(stress.m2c, stress.maxc) # BIC suggests reduced model is better, whereas based on AIC maximum model should be favoured (but that one gave warnings)
+stress.m3c <- update(stress.m3, REML=F); stress.maxc <- update(stress.max, REML=F)
+anova(stress.m3c, stress.maxc) # reduced model fits significantly better
 
 # compare results for maximal and reduced model
-stress.results <- left_join(nice(stress.max), nice(stress.m2), by = "Effect", suffix = c("_full", "_final")) # condition effect holds up no matter the model
+stress.results <- left_join(nice(stress.max), nice(stress.m3), by = "Effect", suffix = c("_full", "_final")) # condition effect holds up no matter the model
 
 # post-hoc contrasts
-emm_stress <- emmeans(stress.m2, "condition")
+emm_stress <- emmeans(stress.m3, "condition")
 emm_stress
 update(pairs(emm_stress), by = NULL, adjust = "holm")
-# sig. higher stress ratings in stress compared to baseline, no sig. differences between con and noc
+# sig. higher stress ratings in stress compared to baseline, only trend difference between con and noc
 
 # save table with model details (includes confidence intervals, marginal and conditional R2)
-tab_model(stress.m2,
+tab_model(stress.m3,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Stress"),
           pred.labels = c("Intercept", 
@@ -402,9 +458,9 @@ tab_model(stress.m2,
 
 # include aversiveness ratings to test for interaction effects
 stress_ratings$aversiveness.z <- scale_this(stress_ratings$aversiveness) # mean center aversiveness ratings
-stress.m2avers <- mixed(stress ~ condition*aversiveness.z + (1+condition*aversiveness.z+run|id) + (1|run), data=stress_ratings, method = "S", 
+stress.m3avers <- mixed(stress ~ condition*aversiveness.z + (1+condition*aversiveness.z+run.z|id) + (1|run), data=stress_ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(stress.m2avers) # no interaction between condition and aversiveness
+summary(stress.m3avers) # no interaction between condition and aversiveness
 ```
 Participants reported higher stress levels in both stress conditions compared to baseline. There was no difference in stress ratings between controllable and uncontrollable stress trials.
 
@@ -451,12 +507,12 @@ helpSpaghetti
 ```{r helplessness ratings - mixed models}
 # test whether helplessness ratings differed between conditions
 # maximal model
-help.max <- mixed(helplessness ~ condition + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+help.max <- mixed(helplessness ~ condition + (1+condition*run.z+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(help.max) # model converged, no warnings
 
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-help.maxd <- lmer(helplessness ~ condition + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+help.maxd <- lmer(helplessness ~ condition + (1+condition*run.z+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000))) 
 plot(help.maxd) # model converged, no warnings
 
@@ -523,33 +579,35 @@ rtSpaghetti
 ```{r rt - mixed models}
 # test whether RTs differed between conditions
 
+stressr <- list(stressr, stressDur[, c(1,4)]) %>% reduce(left_join, by = "id") # add stress duration difference
+stressr$stress_dur_diff.z <- scale_this(stressr$stress_dur_diff) # mean center stress duration difference
 stressr$run.z <- scale_this(stressr$run) # mean center run
 
 # maximal model
-rt.max <- mixed(rt ~ condition + (1+condition*run.z|id), data=stressr, method = "S", 
+rt.max <- mixed(rt ~ condition + (1+condition*run.z+stress_dur_diff.z|id), data=stressr, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(rt.max) # singular fit
 
 # remove correlation of random slopes and intercepts by id
-rt.m1 <- mixed(rt ~ condition + (1+condition*run||id), data=stressr, method = "S", 
+rt.m1 <- mixed(rt ~ condition + (1+condition*run.z+stress_dur_diff.z||id), data=stressr, method = "S",
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(rt.m1) # singular fit
 
 # remove interaction of random slopes
-rt.m2 <- mixed(rt ~ condition + (1+condition+run||id), data=stressr, method = "S", 
+rt.m2 <- mixed(rt ~ condition + (1+condition+run.z+stress_dur_diff.z||id), data=stressr, method = "S",
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(rt.m2) # singular fit
 
 # print random effects terms to inform further model reduction
 summary(rt.m2)$varcor
 
-# remove random slopes for condition and add correlation again
-rt.m3 <- mixed(rt ~ condition + (1+run|id), data=stressr, method = "S", 
+# remove random slopes for condition and add correlations again
+rt.m3 <- mixed(rt ~ condition + (1+run.z+stress_dur_diff.z|id), data=stressr, method = "S",
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(rt.m3) # model converged, no warnings
 
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-rt.m3d <- lmer(rt ~ condition + (1+run|id), data=stressr, method = "S", 
+rt.m3d <- lmer(rt ~ condition  + (1+run.z+stress_dur_diff.z|id), data=stressr, method = "S",
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 plot(rt.m3d)
 
@@ -558,10 +616,10 @@ lattice::dotplot(ranef(rt.m3d))
 
 # compare maximal and reduced model
 rt.m3c <- update(rt.m3, REML=F); rt.maxc <- update(rt.max, REML=F)
-anova(rt.m3c, rt.maxc) # reduced model fits better
+anova(rt.m3c, rt.maxc) # reduced model shows significantly better fit
 
 # compare results for maximal and reduced model
-rt.results <- left_join(nice(rt.max), nice(rt.m3), by = "Effect", suffix = c("_full", "_final")) 
+rt.results <- left_join(nice(rt.max), nice(rt.m3), by = "Effect", suffix = c("_full", "_final"))
 
 # post-hoc contrasts
 emm_rt <- emmeans(rt.m3, "condition")
@@ -573,7 +631,7 @@ update(pairs(emm_rt), by = NULL, adjust = "holm")
 tab_model(rt.m3,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Reaction Times"),
-          pred.labels = c("Intercept", 
+          pred.labels = c("Intercept",
                           "Condition-CON",
                           "Condition-UNCON"),
           file = "../output/rt_model.html")
@@ -651,49 +709,64 @@ corrSpaghetti
 ```{r correct responses - mixed models}
 # test whether performance differed between conditions
 
+stressc <- list(stressc, stressDur[, c(1,4)]) %>% reduce(left_join, by = "id") # add stress duration difference
+stressc$stress_dur_diff.z <- scale_this(stressc$stress_dur_diff) # mean center stress duration difference
 stressc$run.z <- scale_this(stressc$run) # mean center run
 
 # maximal model
-corr.max <- mixed(correct ~ condition + (1+condition*run.z|id), data=stressc, family = binomial, method="LRT",
+corr.max <- mixed(correct ~ condition + (1+condition*run.z+stress_dur_diff.z|id), data=stressc, family = binomial, method="LRT",
                   control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(corr.max) # singular fit              
 
 # remove correlation of random slopes and intercepts by id
-corr.m1 <- mixed(correct ~ condition + (1+condition*run.z||id), data=stressc, family = binomial, method="LRT",
+corr.m1 <- mixed(correct ~ condition + (1+condition*run.z+stress_dur_diff.z||id), data=stressc, family = binomial, method="LRT",
                   control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(corr.m1) # singular fit
 
 # print random effects terms to inform further model reduction
 summary(corr.m1)$varcor
 
-# remove random slopes for condition and add correlation again
-corr.m2 <- mixed(correct ~ condition + (1+run.z|id), data=stressc, family = binomial, method="LRT",
+# remove interaction of random slopes
+corr.m2 <- mixed(correct ~ condition + (1+condition+run.z+stress_dur_diff.z||id), data=stressc, family = binomial, method="LRT",
                   control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(corr.m2) # model converged, no warnings
+summary(corr.m2) # singular fit
+
+# print random effects terms to inform further model reduction
+summary(corr.m2)$varcor
+
+# remove random slopes for run
+corr.m3 <- mixed(correct ~ condition + (1+condition+stress_dur_diff.z||id), data=stressc, family = binomial, method="LRT",
+                  control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(corr.m3) # singular fit
+
+# remove random slopes for condition
+corr.m4 <- mixed(correct ~ condition + (1+stress_dur_diff.z||id), data=stressc, family = binomial, method="LRT",
+                  control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(corr.m4) # model converged, no warnings
 
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-corr.m2d <- glmer(correct ~ condition + (1+run|id), data=stressc, family = binomial,
+corr.m4d <- glmer(correct ~ condition + (1+stress_dur_diff.z||id), data=stressc, family = binomial,
                   control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-plot(corr.m2d) # ceiling effect?!
+plot(corr.m4d) # ceiling effect?!
 
 # plot random effects
-lattice::dotplot(ranef(corr.m2d))
+lattice::dotplot(ranef(corr.m4d))
 
 # compare maximal and reduced model
-corr.m2c <- update(corr.m2, REML=F); corr.maxc <- update(corr.max, REML=F)
-anova(corr.m2c, corr.maxc) # reduced model fits better but no sig. difference
+corr.m4c <- update(corr.m4, REML=F); corr.maxc <- update(corr.max, REML=F)
+anova(corr.m4c, corr.maxc) # reduced model fits significantly better
 
 # compare results for maximal and reduced model
-corr.results <- left_join(nice(corr.max), nice(corr.m2), by = "Effect", suffix = c("_full", "_final")) 
+corr.results <- left_join(nice(corr.max), nice(corr.m4), by = "Effect", suffix = c("_full", "_final")) 
 
-# post-hoc cntrasts
-emm_corr <- emmeans(corr.m2, "condition")
+# post-hoc contrasts
+emm_corr <- emmeans(corr.m4, "condition")
 emm_corr
 update(pairs(emm_corr), by = NULL, adjust = "holm")
 # higher rate of correct responses in con and noc compared to baseline, performance in con is also sig. better than in noc
 
 # save table with model details (includes confidence intervals, marginal and conditional R2)
-tab_model(corr.m2,
+tab_model(corr.m4,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Correct Responses"),
           pred.labels = c("Intercept", 
@@ -752,54 +825,51 @@ hrSpaghetti
 ```{r hr - mixed models}
 # test whether HR differed between conditions
 
-hr$run.z <- scale_this(hr$run)
+hr <- list(hr, stressDur[, c(1,4)]) %>% reduce(left_join, by = c("id")); hr$id <- as.factor(hr$id) # add stress duration difference
+hr$stress_dur_diff.z <- scale_this(hr$stress_dur_diff) # mean center stress duration difference
+hr$run.z <- scale_this(hr$run) # mean center run
 
 # maximal model
-hr.max <- mixed(bpm ~ condition + (1+condition*run|id), data=hr, method = "S", 
+hr.max <- mixed(bpm ~ condition + (1+condition*run.z+stress_dur_diff.z|id), data=hr, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
 summary(hr.max) # singular fit
 
 # remove correlation of random slopes and intercepts by id
-hr.m1 <- mixed(bpm ~ condition + (1+condition*run.z||id), data=hr, method = "S", 
+hr.m1 <- mixed(bpm ~ condition + (1+condition*run.z+stress_dur_diff.z||id), data=hr, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(hr.m1) # singular fit
 
+# print random effects terms to inform further model reduction
+summary(hr.m1)$varcor
+
 # remove random slopes for condition
-hr.m2 <- mixed(bpm ~ condition + (1+condition+run||id), data=hr, method = "S", 
+hr.m2 <- mixed(bpm ~ condition + (1+run.z+stress_dur_diff.z||id), data=hr, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)), expand_re=T)
 summary(hr.m2) # model converged, no warnings
 
-# print random effects terms to inform further model reduction
-summary(hr.m2)$varcor
-
-# remove random slopes for condition and add correlation again
-hr.m3 <- mixed(bpm ~ condition + (1+run|id), data=hr, method = "S", 
-             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(hr.m3) # model converged, no warnings
-
 # diagnostic plot for reduced model (use lmer because "fitted" doesn't work on afex model)
-hr.m3d <- lmer(bpm ~ condition + (1+run|id), data=hr, method = "S", 
+hr.m2d <- lmer(bpm ~ condition + (1+run.z+stress_dur_diff.z||id), data=hr, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-plot(hr.m3d)
+plot(hr.m2d)
 
 # plot random effects
-lattice::dotplot(ranef(hr.m3d))
+lattice::dotplot(ranef(hr.m2d))
 
 # compare maximal and reduced model
-hr.m3c <- update(hr.m3, REML=F); hr.maxc <- update(hr.max, REML=F)
-anova(hr.m3c, hr.maxc) # reduced model fits better, but no sig. difference
+hr.m2c <- update(hr.m2, REML=F); hr.maxc <- update(hr.max, REML=F)
+anova(hr.m2c, hr.maxc) # reduced model fits better, but no sig. difference
 
 # compare results for maximal and reduced model
-hr.results <- left_join(nice(hr.max), nice(hr.m3), by = "Effect", suffix = c("_full", "_final")) # condition effect only in reduced model
+hr.results <- left_join(nice(hr.max), nice(hr.m2), by = "Effect", suffix = c("_full", "_final")) # condition effect only in reduced model
 
 # post-hoc contrasts
-emm_hr <- emmeans(hr.m3, "condition")
+emm_hr <- emmeans(hr.m2, "condition")
 emm_hr
 update(pairs(emm_hr), by = NULL, adjust = "holm")
 # HR is sig. higher con compared to bas, no other sig. contrasts
 
 # save table with model details
-tab_model(hr.m3,
+tab_model(hr.m2,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Heart Rate"),
           pred.labels = c("Intercept", 
@@ -809,9 +879,9 @@ tab_model(hr.m3,
 ```
 Heart rates were higher under controllable stress compared to baseline. No other contrasts were significant.
 
-# MR Parameter Estimates
+# MR Parameter Estimates from vmPFC
 
-```{r plot MR parameter estimates}
+```{r plot MR parameter estimates from vmPFC}
 # compute summary statistics for conditions and runs
 betasCondRun_sumstats <- summarySEwithin2(betas, measurevar="beta_weight", withinvars=c("condition", "run"), idvar="id", conf.interval=.95, na.rm=T) 
 
@@ -821,7 +891,7 @@ betasBar <- ggplot(betasCondRun_sumstats, aes(x=run, y=beta_weight, fill=conditi
   geom_errorbar(aes(ymin=beta_weight-se, ymax=beta_weight+se), position=position_dodge(0.9), size=1, width =.2, colour="black") +
   labs(y="Parameter Estimates", x="Run") +
   laura_theme() +
-  scale_fill_manual(values=c(colour2, colour3), labels=c("CON", "UNCON"))
+  scale_fill_manual(values=c(colour1, colour2, colour3), labels=c("BASE", "CON", "UNCON"))
 betasBar
 ```
 
@@ -829,24 +899,54 @@ betasBar
 
 ```{r MR parameter estimates}
 # include beta weights in models
-stress_ratings$beta_weight.z <- scale_this(stress_ratings$beta_weight) # mean center beta weights
+
+# mean center beta weights
+ratings$beta_weight.z <- scale_this(ratings$beta_weight) 
+stress_ratings$beta_weight.z <- scale_this(stress_ratings$beta_weight) 
 
 # stress
-stress.m2Beta <- mixed(stress ~ condition*beta_weight.z + (1+condition+run.z|id), data=stress_ratings, method = "S", 
+stress.m3Beta <- mixed(stress ~ condition*beta_weight.z + (1+condition+run.z|id), data=ratings, method = "S", 
                        control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(stress.m2Beta) # no modulation
+summary(stress.m3Beta) # no modulation
 
-stressBeta.results <- nice(stress.m2Beta)
+stressBeta.results <- nice(stress.m3Beta)
+
+# post-hoc contrasts of slopes
+emtrends(stress.m3Beta, pairwise ~ condition, var = "beta_weight.z")
+emmip(stress.m3Beta, condition ~ beta_weight.z, cov.reduce = range)
 
 # helplessness
-help.maxBeta <- mixed(helplessness ~ condition*beta_weight.z + (1+condition*run.z|id), data=stress_ratings, method = "S", 
+help.maxBeta <- mixed(helplessness ~ condition*beta_weight.z + (1+condition*run.z+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
              control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
-summary(help.maxBeta) # sig. interaction
+summary(help.maxBeta) # singular fit
 
-helpBeta.results <- nice(help.maxBeta)
+# print random effects terms to inform further model reduction
+summary(help.maxBeta)$varcor 
+
+# remove interaction of random slopes
+help.maxBeta2 <- mixed(helplessness ~ condition*beta_weight.z + (1+condition+run.z+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(help.maxBeta2) # singular fit
+
+# remove random slopes for run
+help.maxBeta3 <- mixed(helplessness ~ condition*beta_weight.z + (1+condition+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(help.maxBeta3) # singular fit
+
+# remove random slopes for condition
+help.maxBeta4 <- mixed(helplessness ~ condition*beta_weight.z + (1+stress_dur_diff.z|id), data=stress_ratings, method = "S", 
+             control = lmerControl(optimizer="bobyqa", optCtrl = list(maxfun=10000)))
+summary(help.maxBeta4) # model converged, no warnings
+
+# compare results for maximal and reduced model
+helpBeta.results <- left_join(nice(help.maxBeta), nice(help.maxBeta4), by = "Effect", suffix = c("_full", "_final")) 
+
+# post-hoc contrast of slopes
+emtrends(help.maxBeta4, pairwise ~ condition, var = "beta_weight.z")
+emmip(help.maxBeta4, condition ~ beta_weight.z, cov.reduce = range)
 
 # save table with model details (includes confidence intervals, marginal and conditional R2)
-tab_model(help.maxBeta,
+tab_model(help.maxBeta4,
           string.ci = "95% CI",
           dv.labels = c("Fixed Effects - Helplessness"),
           pred.labels = c("Intercept", 
@@ -872,7 +972,7 @@ VmPFC activation modulated helplessness ratings for uncontrollable stress, not f
 # Controllability effect
 # get p-values from relevant tests (con vs. noc)
 DV <- c("stress", "helplessness", "RT", "correct", "hr")
-p.orig <- c(.0845, .0001, .0001, .0069, .1159 ) # p-values in order of DVs
+p.orig <- c(.0845, .0001, .0001, .0073, .1159) # p-values in order of DVs
 correction <- data.frame(DV, p.orig)
 correction <- correction[order(correction$p.orig),] # order by p-value
 
